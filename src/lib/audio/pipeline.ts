@@ -1,78 +1,164 @@
 /**
  * TrackTuner — pipeline de procesado.
- * Orquesta: decodificar MP3 → analizar → generar fixers → renderizar offline → devolver audio.
- * Todo client-side; no toca el servidor.
+ * Orquesta: análisis → cadena de mastering paso a paso → render offline.
+ *
+ * v2: cada fixer se aplica por separado en una cadena secuencial; después de cada
+ * paso se vuelve a analizar el audio para medir el ANTES→DESPUÉS real de esa
+ * mejora. El render offline reporta progreso en tiempo real (truco suspend/resume).
  */
 
 import { analyzeAudio } from "./analysis";
-import { DEFAULT_PRESET, presetFromDiagnostics } from "./fixers";
-import type { AnalysisResult, Fixer, PipelinePreset } from "./types";
+import type { AnalysisProgress, AnalysisResult, ChainProgress, Fixer, FixerRunResult, MasterResult } from "./types";
 
-export interface PipelineInput {
-  audioBuffer: AudioBuffer;
-  preset?: PipelinePreset;
+/** Mezcla un AudioBuffer estéreo/multicanal a mono (Float32Array). */
+export function mixToMono(buffer: AudioBuffer): Float32Array {
+  const ch = buffer.numberOfChannels;
+  const len = buffer.length;
+  const out = new Float32Array(len);
+  for (let c = 0; c < ch; c++) {
+    const data = buffer.getChannelData(c);
+    for (let i = 0; i < len; i++) out[i] += data[i] / ch;
+  }
+  return out;
 }
 
-export interface PipelineOutput {
-  analysis: AnalysisResult;
-  fixedBuffer: AudioBuffer;
-  fixers: Fixer[];
-}
-
-/**
- * Analiza el buffer y construye el diagnóstico completo (sin renderizar aún).
- */
-export function runAnalysis(audioBuffer: AudioBuffer): AnalysisResult {
-  const { samples } = mixToMono(audioBuffer);
-  return analyzeAudio(samples, audioBuffer.sampleRate, { targetLufs: DEFAULT_PRESET.targetLufs });
+/** Analiza un AudioBuffer completo (con progreso opcional por fases). */
+export function analyzeBuffer(buffer: AudioBuffer, onProgress?: (p: AnalysisProgress) => void): AnalysisResult {
+  return analyzeAudio(mixToMono(buffer), buffer.sampleRate, { onProgress });
 }
 
 /**
- * Ejecuta el arreglo completo: análisis → fixers → render offline.
+ * Render offline de un grafo con progreso real.
+ * El truco: se programan suspends en tiempos regulares; cada vez que el contexto
+ * se suspende leemos currentTime/duration → porcentaje → reanudamos.
+ * Para pistas cortas (dur < 0.5s) no hay checkpoints: el progreso salta a 100%.
  */
-export async function processTrack(input: PipelineInput): Promise<PipelineOutput> {
-  const preset = input.preset ?? DEFAULT_PRESET;
-  const analysis = runAnalysis(input.audioBuffer);
-
-  // construimos el grafo de fixers
-  const fixers = presetFromDiagnostics(analysis.issues, preset);
-
-  // render offline en el mismo sampleRate
-  const ctx = new OfflineAudioContext(
-    input.audioBuffer.numberOfChannels,
-    input.audioBuffer.length,
-    input.audioBuffer.sampleRate,
-  );
-
-  // buffer de origen
+async function renderGraph(
+  buffer: AudioBuffer,
+  fixers: Fixer[],
+  onProgress: (pct: number) => void,
+): Promise<AudioBuffer> {
+  const ctx = new OfflineAudioContext(buffer.numberOfChannels, buffer.length, buffer.sampleRate);
   const src = ctx.createBufferSource();
-  src.buffer = input.audioBuffer;
-  src.connect(ctx.destination);
+  src.buffer = buffer;
 
-  // cadena de fixers
   let node: AudioNode = src;
   for (const f of fixers) {
     if (!f.enabled) continue;
     node = f.apply(ctx, node);
   }
   node.connect(ctx.destination);
+  src.start(0);
+
+  const duration = buffer.duration;
+  const checkpoints = duration > 0.5 ? Math.max(4, Math.min(60, Math.round(duration))) : 0;
+  for (let i = 1; i <= checkpoints; i++) {
+    void ctx.suspend((duration * i) / (checkpoints + 1));
+  }
+
+  let last = 0;
+  ctx.onstatechange = () => {
+    if (ctx.state === "suspended" && duration > 0) {
+      const pct = Math.min(0.98, ctx.currentTime / duration);
+      if (pct > last) {
+        last = pct;
+        onProgress(pct);
+      }
+      void ctx.resume();
+    }
+  };
 
   const rendered = await ctx.startRendering();
-  return { analysis, fixedBuffer: rendered, fixers };
+  onProgress(1);
+  return rendered;
 }
 
-/** Mezcla a mono (promedio de canales) para el análisis. */
-export function mixToMono(buffer: AudioBuffer): { samples: Float32Array; channels: number } {
-  const { numberOfChannels, length } = buffer;
-  if (numberOfChannels === 1) {
-    return { samples: buffer.getChannelData(0), channels: 1 };
+export interface MasterCallbacks {
+  /** evento por paso de la cadena (parciales, mergear por índice) */
+  onChain?: (stepIndex: number, run: Partial<FixerRunResult>) => void;
+  /** progreso global de la cadena */
+  onProgress?: (p: ChainProgress) => void;
+}
+
+/**
+ * Ejecuta la cadena de mastering paso a paso: para cada fixer habilitado,
+ * renderiza el prefijo de la cadena, mide antes/después y entrega el buffer final.
+ */
+export async function masterTrack(
+  buffer: AudioBuffer,
+  fixers: Fixer[],
+  cb: MasterCallbacks = {},
+): Promise<MasterResult> {
+  const started = performance.now();
+  const enabled = fixers.filter((f) => f.enabled);
+  const total = enabled.length;
+  const chain: FixerRunResult[] = [];
+
+  // Si no hay fixers habilitados, devolvemos el original tal cual.
+  if (total === 0) {
+    const analysis = analyzeBuffer(buffer);
+    cb.onProgress?.({ overall: 1, stepIndex: 0, stepTotal: 0 });
+    return { buffer, analysis, chain, elapsedMs: performance.now() - started };
   }
-  const out = new Float32Array(length);
-  for (let ch = 0; ch < numberOfChannels; ch++) {
-    const data = buffer.getChannelData(ch);
-    for (let i = 0; i < length; i++) out[i] += data[i];
+
+  const initial = analyzeBuffer(buffer);
+  let current = buffer;
+  let before = initial;
+
+  for (let i = 0; i < total; i++) {
+    const f = enabled[i];
+    const stepStart = performance.now();
+    const run: FixerRunResult = {
+      fixerId: f.id,
+      status: "rendering",
+      progress: 0,
+      before,
+      after: before,
+      metricBefore: f.meta.getMetric(before),
+      metricAfter: f.meta.getMetric(before),
+      durationMs: 0,
+    };
+    chain.push(run);
+    cb.onChain?.(i, { status: "rendering", progress: 0 });
+    cb.onProgress?.({ overall: i / total, stepIndex: i, stepTotal: total });
+
+    try {
+      // 1) render del prefijo de cadena con progreso en tiempo real
+      const rendered = await renderGraph(current, enabled.slice(0, i + 1), (pct) => {
+        run.progress = pct;
+        cb.onChain?.(i, { progress: pct });
+      });
+
+      // 2) medición real del después
+      run.status = "measuring";
+      run.progress = 0.99;
+      cb.onChain?.(i, { status: "measuring" });
+
+      const after = analyzeBuffer(rendered);
+      const mv = f.meta.getMetric(before);
+      const ma = f.meta.getMetric(after);
+
+      run.before = before;
+      run.after = after;
+      run.metricBefore = mv;
+      run.metricAfter = ma;
+      run.durationMs = performance.now() - stepStart;
+      run.status = "done";
+      run.progress = 1;
+
+      current = rendered;
+      before = after;
+
+      cb.onChain?.(i, { status: "done", progress: 1, metricBefore: mv, metricAfter: ma, before, after });
+      cb.onProgress?.({ overall: (i + 1) / total, stepIndex: i, stepTotal: total });
+    } catch (e) {
+      run.status = "error";
+      run.error = e instanceof Error ? e.message : String(e);
+      cb.onChain?.(i, { status: "error", error: run.error });
+      cb.onProgress?.({ overall: (i + 1) / total, stepIndex: i, stepTotal: total });
+      break; // cadena truncada: entregamos lo procesado hasta ahora
+    }
   }
-  const scale = 1 / numberOfChannels;
-  for (let i = 0; i < length; i++) out[i] *= scale;
-  return { samples: out, channels: numberOfChannels };
+
+  return { buffer: current, analysis: before, chain, elapsedMs: performance.now() - started };
 }

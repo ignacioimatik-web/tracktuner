@@ -1,7 +1,6 @@
 /**
  * TrackTuner — exportación de audio.
- * Convierte un AudioBuffer renderizado a WAV (16-bit PCM) descargable.
- * MP3 codificado en cliente requeriría un encoder wasm; v1 exporta WAV.
+ * WAV 16-bit PCM (síncrono) y MP3 320 kbps (encoder lamejs en cliente, con progreso).
  */
 
 /** Codifica un AudioBuffer intercalado a WAV 16-bit PCM y dispara la descarga. */
@@ -49,7 +48,70 @@ export function exportWav(buffer: AudioBuffer, filename = "tracktuner.wav"): voi
     }
   }
 
-  const blob = new Blob([out], { type: "audio/wav" });
+  downloadBlob(new Blob([out], { type: "audio/wav" }), filename);
+}
+
+/** Convierte un canal Float32 a Int16 (entrada del encoder MP3). */
+function toInt16(f32: Float32Array): Int16Array {
+  const out = new Int16Array(f32.length);
+  for (let i = 0; i < f32.length; i++) {
+    const s = Math.max(-1, Math.min(1, f32[i]));
+    out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+  }
+  return out;
+}
+
+/**
+ * Codifica un AudioBuffer a MP3 320 kbps en cliente (lamejs wasm, dynamic import)
+ * y dispara la descarga. Reporta progreso por bloques de frames.
+ */
+export async function exportMp3(
+  buffer: AudioBuffer,
+  filename = "tracktuner.mp3",
+  onProgress?: (pct: number) => void,
+): Promise<void> {
+  const { Mp3Encoder } = await import("@breezystack/lamejs");
+  const channels = Math.min(2, buffer.numberOfChannels);
+  const rate = buffer.sampleRate;
+  const left = toInt16(buffer.getChannelData(0));
+  const right = channels === 2 ? toInt16(buffer.getChannelData(1)) : undefined;
+
+  const enc = new Mp3Encoder(channels, rate, 320);
+  const block = 1152; // frames por bloque estándar MPEG-1 Layer III
+  const total = Math.max(1, Math.ceil(left.length / block));
+  const chunks: Uint8Array[] = [];
+
+  for (let i = 0; i < total; i++) {
+    const s = i * block;
+    const e = Math.min(s + block, left.length);
+    const l = left.subarray(s, e);
+    const r = right ? right.subarray(s, e) : undefined;
+    const out = enc.encodeBuffer(l, r) as Uint8Array;
+    if (out.length > 0) chunks.push(out);
+    if (i % 4 === 0) {
+      onProgress?.(i / total);
+      // cede el hilo cada ~40 bloques para que la UI siga viva
+      if (i % 40 === 0) await new Promise((r) => setTimeout(r, 0));
+    }
+  }
+
+  const tail = enc.flush() as Uint8Array;
+  if (tail.length > 0) chunks.push(tail);
+  onProgress?.(1);
+
+  // fusiona todos los bloques en un único ArrayBuffer (compatible BlobPart)
+  const totalBytes = chunks.reduce((acc, c) => acc + c.length, 0);
+  const merged = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const c of chunks) {
+    merged.set(c, offset);
+    offset += c.length;
+  }
+
+  downloadBlob(new Blob([merged.buffer], { type: "audio/mpeg" }), filename);
+}
+
+function downloadBlob(blob: Blob, filename: string): void {
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;

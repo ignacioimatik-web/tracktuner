@@ -4,7 +4,7 @@
  * Puro cálculo sobre Float32Array; sin dependencia del DOM ni del grafo de audio.
  */
 
-import type { AnalysisResult, BandLevel, Diagnostic } from "./types";
+import type { AnalysisProgress, AnalysisResult, BandLevel, Diagnostic } from "./types";
 
 export interface AnalysisOptions {
   /** LUFS objetivo de referencia para el diagnóstico de loudness */
@@ -13,13 +13,20 @@ export interface AnalysisOptions {
   maxTruePeakDbtp?: number;
   /** umbral para considerar una banda espectral "apagada" (desviación negativa, dB) */
   dullBandThresholdDb?: number;
+  /** callback de progreso en tiempo real (fases del análisis) */
+  onProgress?: (p: AnalysisProgress) => void;
 }
 
-const DEFAULTS: Required<AnalysisOptions> = {
+const DEFAULTS: Required<Pick<AnalysisOptions, "targetLufs" | "maxTruePeakDbtp" | "dullBandThresholdDb">> = {
   targetLufs: -14,
   maxTruePeakDbtp: -1.0,
   dullBandThresholdDb: -6,
 };
+
+/** Subconjunto de opciones con valores por defecto (sin callbacks). */
+type AnalysisDefaults = Required<
+  Pick<AnalysisOptions, "targetLufs" | "maxTruePeakDbtp" | "dullBandThresholdDb">
+>;
 
 /** Gating para medición integrada EBU R128: -70 LUFS absolutos, bloques de 400 ms. */
 const GATE_ABSOLUTE_LUFS = -70;
@@ -94,6 +101,7 @@ function fftMag(re: Float32Array, im: Float32Array, size: number): void {
 function bandAnalysis(
   samples: Float32Array,
   sampleRate: number,
+  onProgress?: (p: AnalysisProgress) => void,
 ): { bands: BandLevel[]; sibilanceRatio: number } {
   const bands: { name: string; low: number; high: number; energy: number }[] = [
     { name: "sub-bass", low: 20, high: 60, energy: 0 },
@@ -143,6 +151,10 @@ function bandAnalysis(
       sibEnergy.v += (re[k] * re[k] + im[k] * im[k]) / (fftSize * fftSize);
     }
     framesUsed++;
+    // progreso en tiempo real: cada lote de frames (~3% del total)
+    if (onProgress && (framesUsed % Math.max(1, Math.floor(nFrames / 32)) === 0 || framesUsed === nFrames)) {
+      onProgress({ phase: "Espectro por bandas", pct: 0.3 + 0.7 * (framesUsed / Math.max(nFrames, 1)) });
+    }
   }
 
   const bandAcc = bandBins.map(({ lo, hi }) => {
@@ -177,7 +189,7 @@ function diagnose(
   clipRatio: number,
   bands: BandLevel[],
   sibilanceRatio: number,
-  opts: Required<AnalysisOptions>,
+  opts: AnalysisDefaults,
 ): Diagnostic[] {
   const issues: Diagnostic[] = [];
   const byName = (n: string) => bands.find((b) => b.name === n);
@@ -280,7 +292,11 @@ export function analyzeAudio(
   sampleRate: number,
   options: AnalysisOptions = {},
 ): AnalysisResult {
-  const opts: Required<AnalysisOptions> = { ...DEFAULTS, ...options };
+  const opts: AnalysisDefaults = {
+    ...DEFAULTS,
+    ...options,
+  };
+  const onProgress = options.onProgress;
   const durationSec = samples.length / sampleRate;
 
   // mezcla a mono si hace falta (por simplicidad medimos sobre el buffer dado)
@@ -288,6 +304,7 @@ export function analyzeAudio(
 
   // metrics
   const integratedLufs = integratedLoudness(mono, sampleRate);
+  onProgress?.({ phase: "Loudness integrada (LUFS)", pct: 0.15 });
 
   // true peak: interpolar 4x para aproximar entre-muestras
   let truePeak = 0;
@@ -310,8 +327,10 @@ export function analyzeAudio(
     if (Math.abs(mono[i]) >= 1.0) clipCount++;
   }
   const clipRatio = mono.length > 0 ? clipCount / mono.length : 0;
+  onProgress?.({ phase: "True peak y clipping", pct: 0.3 });
 
-  const { bands, sibilanceRatio } = bandAnalysis(mono, sampleRate);
+  const { bands, sibilanceRatio } = bandAnalysis(mono, sampleRate, onProgress);
+  onProgress?.({ phase: "Diagnóstico", pct: 1 });
   const issues = diagnose(integratedLufs, truePeakDbtp, clipRatio, bands, sibilanceRatio, opts);
 
   return {
