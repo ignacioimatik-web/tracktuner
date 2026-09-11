@@ -9,6 +9,10 @@
 
 import { analyzeAudio } from "./analysis";
 import type { AnalysisProgress, AnalysisResult, ChainProgress, Fixer, FixerRunResult, MasterResult } from "./types";
+import { createFixer } from "./fixers";
+
+/** LUFS objetivo de streaming (coincide con DEFAULT_PRESET.targetLufs). */
+export const TARGET_LUFS = -14;
 
 /** Mezcla un AudioBuffer estéreo/multicanal a mono (Float32Array). */
 export function mixToMono(buffer: AudioBuffer): Float32Array {
@@ -106,7 +110,13 @@ export async function masterTrack(
   let before = initial;
 
   for (let i = 0; i < total; i++) {
-    const f = enabled[i];
+    // Normalización exacta: el paso de gain calcula la ganancia que deja el
+    // audio a TARGET_LUFS medido de verdad (no un ajuste fijo del diagnóstico).
+    let f = enabled[i];
+    if (f.id === "gain" && isFinite(before.integratedLufs)) {
+      const db = TARGET_LUFS - before.integratedLufs;
+      f = createFixer("gain", { db: Math.round(db * 100) / 100 }, f.amount, true);
+    }
     const stepStart = performance.now();
     const run: FixerRunResult = {
       fixerId: f.id,
@@ -123,8 +133,10 @@ export async function masterTrack(
     cb.onProgress?.({ overall: i / total, stepIndex: i, stepTotal: total });
 
     try {
-      // 1) render del prefijo de cadena con progreso en tiempo real
-      const rendered = await renderGraph(current, enabled.slice(0, i + 1), (pct) => {
+      // 1) render del prefijo de cadena con progreso en tiempo real.
+      //    Importante: usar la lista con el fixer recalculado (p.ej. gain exacto).
+      const chainFixers = enabled.map((x, j) => (j === i ? f : x));
+      const rendered = await renderGraph(current, chainFixers.slice(0, i + 1), (pct) => {
         run.progress = pct;
         cb.onChain?.(i, { progress: pct });
       });
